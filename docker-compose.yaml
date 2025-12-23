@@ -1,0 +1,221 @@
+version: "3"
+
+services:
+  catalog:
+    image: projectnessie/nessie
+    container_name: catalog
+    networks:
+      data-lake-network:
+    ports:
+      - 19120:19120
+
+  trino:
+    image: trinodb/trino
+    container_name: trino
+    networks:
+      data-lake-network:
+    ports:
+      - 8080:8080
+    volumes:
+      - "./trino/trino_connections/iceberg_datalake.properties:/etc/trino/catalog/iceberg_datalake.properties"
+      - "./trino/coordinator-config.properties:/etc/trino/config.properties"
+
+  trino-worker:
+    image: trinodb/trino
+    networks:
+      data-lake-network:
+    volumes:
+      - "./trino/trino_connections/iceberg_datalake.properties:/etc/trino/catalog/iceberg_datalake.properties"
+      - "./trino/worker-1/worker-config.properties:/etc/trino/config.properties"
+
+  storage:
+    image: minio/minio
+    container_name: storage
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=storage
+      - MINIO_REGION_NAME=us-east-1
+      - MINIO_REGION=us-east-1
+    networks:
+      data-lake-network:
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+
+
+  mc:
+    depends_on:
+      - storage
+      - catalog
+    image: minio/mc
+    container_name: mc
+    networks:
+      data-lake-network:
+        aliases:
+          - minio.storage
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+        until (/usr/bin/mc alias set minio http://storage:9000 admin password) do echo '...waiting...' && sleep 1; done;
+        /usr/bin/mc rm -r --force minio/bronze || true;
+        /usr/bin/mc rm -r --force minio/silver || true;
+        /usr/bin/mc rm -r --force minio/gold || true;
+        /usr/bin/mc mb -p minio/bronze;
+        /usr/bin/mc mb -p minio/silver;
+        /usr/bin/mc mb -p minio/gold;
+        /usr/bin/mc mb -p minio/checkpoints;
+        /usr/bin/mc anonymous set public minio/bronze;
+        /usr/bin/mc anonymous set public minio/silver;
+        /usr/bin/mc anonymous set public minio/gold;
+        /usr/bin/mc anonymous set public minio/checkpoints;
+        echo 'Buckets created successfully';
+        tail -f /dev/null
+        "
+
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    ports:
+      - 9092:9092
+    networks:
+      - data-lake-network
+    healthcheck:
+      test: [ "CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092" ]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      CLUSTER_ID: "cAJ8d9BqSvKhXklYr1SNOg"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+    command: >
+      bash -c "/etc/confluent/docker/run &
+               while ! kafka-topics --bootstrap-server kafka:9092 --list > /dev/null 2>&1; do
+                 sleep 1;
+               done;
+               kafka-topics --bootstrap-server kafka:9092 --create --topic census_persons_topic --if-not-exists --partitions 12 --replication-factor 1;
+               wait"
+
+  spark:
+    build:
+      context: .
+      dockerfile: ./spark/Dockerfile
+    container_name: spark-master
+    ports:
+      - 7077:7077
+      - 8088:8080
+    networks:
+      - data-lake-network
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - SPARK_NO_DAEMONIZE=true
+    volumes:
+      - ./spark-jobs:/app
+    depends_on:
+      - kafka
+      - storage
+      - catalog
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[*]
+      --driver-memory 2g
+      --executor-memory 2g
+      --jars /opt/spark/extra-jars/iceberg-spark-runtime-3.5_2.12-1.8.0.jar,/opt/spark/extra-jars/nessie-spark-extensions-3.5_2.12-0.102.5.jar,/opt/spark/extra-jars/hadoop-aws-3.3.4.jar,/opt/spark/extra-jars/aws-java-sdk-bundle-1.12.262.jar,/opt/spark/extra-jars/spark-sql-kafka-0-10_2.12-3.5.1.jar,/opt/spark/extra-jars/spark-token-provider-kafka-0-10_2.12-3.5.1.jar,/opt/spark/extra-jars/kafka-clients-3.4.1.jar,/opt/spark/extra-jars/commons-pool2-2.11.1.jar,/opt/spark/extra-jars/wildfly-openssl-1.0.7.Final.jar
+      --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.projectnessie.spark.extensions.NessieSparkSessionExtensions
+      --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog
+      --conf spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog
+      --conf spark.sql.catalog.nessie.uri=http://catalog:19120/api/v1
+      --conf spark.sql.catalog.nessie.ref=main
+      --conf spark.sql.catalog.nessie.warehouse=s3a://bronze/
+      --conf spark.sql.catalog.nessie.authentication.type=NONE
+      --conf spark.sql.defaultCatalog=nessie
+      --conf spark.sql.catalog.nessie.cache-enabled=true
+      --conf spark.sql.catalog.nessie.gc-enabled=true
+      --conf spark.hadoop.fs.s3a.endpoint=http://storage:9000
+      --conf spark.hadoop.fs.s3a.access.key=admin
+      --conf spark.hadoop.fs.s3a.secret.key=password
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+      --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+      --conf spark.sql.streaming.checkpointLocation=s3a://checkpoints/
+      /app/medallion_pipeline.py --mode streaming
+
+  census-producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: census-producer
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=census_persons_topic
+      - SEND_INTERVAL=0.05
+    networks:
+      - data-lake-network
+    depends_on:
+      - kafka
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+  superset:
+    image: apache/superset:latest
+    container_name: superset
+    networks:
+      - data-lake-network
+    environment:
+      - SUPERSET_SECRET_KEY=supersecretkey123456789
+      - SUPERSET_LOAD_EXAMPLES=no
+    ports:
+      - "8089:8089"
+    volumes:
+      - ./superset:/app/superset_home
+    depends_on:
+      - trino
+    user: root
+    command: >
+      /bin/bash -c "
+      echo 'Installing Trino driver in Superset venv...'
+      pip install trino sqlalchemy-trino &&
+      echo 'Verifying installation...'
+      pip list | grep -i trino || true &&
+      superset db upgrade &&
+      superset fab create-admin
+        --username admin
+        --firstname Admin
+        --lastname User
+        --email admin@superset.com
+        --password admin || true &&
+      superset init &&
+      superset run -h 0.0.0.0 -p 8089
+      "
+
+networks:
+  data-lake-network:
+
